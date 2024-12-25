@@ -134,7 +134,7 @@ async def approve_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     setup_database()
-    app = ApplicationBuilder().token("YOUR_BOT_TOKEN").build()
+    app = ApplicationBuilder().token("7203175973:AAGGPJnAezqG6iaXYrX_chmreYwBxUYwbwI").build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
