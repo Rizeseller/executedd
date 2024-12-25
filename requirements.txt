@@ -1,4 +1,2 @@
-python-telegram-bot==20.3
-mysql-connector-python
-pyTelegramBotAPI
-mysql-connector-python
+python-telegram-bot==20.1
+sqlite3
