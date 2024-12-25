@@ -1,153 +1,145 @@
-import telebot
-from telebot.types import Message
-import mysql.connector
-import time
-import threading
+import os
+import sqlite3
+from telegram import Update, ChatInviteLink
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import logging
+from datetime import datetime, timedelta
 
-# Variabile per il token del bot
-BOT_TOKEN = ""  # Da impostare nelle variabili della VPS
-bot = telebot.TeleBot(BOT_TOKEN)
+# Configurazione logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Dati di connessione al database MySQL
-DB_CONFIG = {
-    "host": "mysql.railway.internal",
-    "user": "root",
-    "password": "BpwzWzXkJkSAdmoYdWdSfLRVobOHYQNa",
-    "database": "railway",
-    "port": 3306
-}
-
+DATABASE = "bot_database.sqlite"
 SUPER_ADMIN = 7839114402
-PENDING_REQUESTS = {}  # Dizionario temporaneo per gestire le richieste
-
-def get_db_connection():
-    return mysql.connector.connect(**DB_CONFIG)
-
-def add_admin(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT IGNORE INTO admins (user_id) VALUES (%s)", (user_id,))
-    conn.commit()
-    conn.close()
-
-def is_admin(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM admins WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
-
-def notify_admins(message):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM admins")
-    admins = cursor.fetchall()
-    conn.close()
-    for admin in admins:
-        bot.send_message(admin[0], message)
-
-def generate_temp_link():
-    return f"https://t.me/joinchat/{int(time.time())}"  # Simulazione del link
-
-@bot.message_handler(commands=['start'])
-def handle_start(message: Message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "[N/A]"
-
-    if user_id in PENDING_REQUESTS:
-        bot.reply_to(message, "Hai già richiesto l'accesso. Attendi una risposta.")
-        return
-
-    PENDING_REQUESTS[user_id] = username
-    bot.reply_to(message, "\u23F0 La tua richiesta per unirti al canale è stata mandata. Un amministratore ti approverà/rifiuterà il prima possibile.")
-    notify_admins(f"❗️@{username} ({user_id}) ha richiesto di unirsi al canale.")
-
-@bot.message_handler(commands=['admin'])
-def handle_admin(message: Message):
-    if message.from_user.id != SUPER_ADMIN:
-        return
-
-    try:
-        _, identifier = message.text.split(maxsplit=1)
-        add_admin(identifier)
-        bot.reply_to(message, f"@{identifier} è stato aggiunto come amministratore.")
-    except Exception as e:
-        bot.reply_to(message, "Errore nell'aggiunta dell'amministratore.")
-
-@bot.message_handler(commands=['approve'])
-def handle_approve(message: Message):
-    try:
-        _, identifier = message.text.split(maxsplit=1)
-        user_id = int(identifier) if identifier.isdigit() else None
-
-        if user_id is None:
-            for uid, uname in PENDING_REQUESTS.items():
-                if uname == identifier:
-                    user_id = uid
-                    break
-
-        if user_id not in PENDING_REQUESTS:
-            bot.reply_to(message, "Richiesta non trovata.")
-            return
-
-        username = PENDING_REQUESTS.pop(user_id)
-        temp_link = generate_temp_link()
-        bot.send_message(user_id, f"✅ La tua richiesta è stata approvata.\n\n📎 > {temp_link}")
-        notify_admins(f"🚨@{username} ({user_id}) è stato approvato.")
-    except Exception as e:
-        bot.reply_to(message, "Errore durante l'approvazione.")
-
-@bot.message_handler(commands=['deny'])
-def handle_deny(message: Message):
-    try:
-        _, identifier, *reason = message.text.split()
-        reason = " ".join(reason) if reason else "Nessun motivo specificato."
-        user_id = int(identifier) if identifier.isdigit() else None
-
-        if user_id is None:
-            for uid, uname in PENDING_REQUESTS.items():
-                if uname == identifier:
-                    user_id = uid
-                    break
-
-        if user_id not in PENDING_REQUESTS:
-            bot.reply_to(message, "Richiesta non trovata.")
-            return
-
-        username = PENDING_REQUESTS.pop(user_id)
-        bot.send_message(user_id, f"❌ La tua richiesta è stata rifiutata.\n\n❓ Motivo: {reason}")
-        notify_admins(f"🚨 La richiesta di @{username} ({user_id}) è stata rifiutata.")
-    except Exception as e:
-        bot.reply_to(message, "Errore durante il rifiuto.")
-
-@bot.message_handler(commands=['approveall'])
-def handle_approve_all(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    try:
-        for user_id, username in list(PENDING_REQUESTS.items()):
-            temp_link = generate_temp_link()
-            bot.send_message(user_id, f"✅ La tua richiesta è stata approvata.\n\n📎 > {temp_link}")
-            notify_admins(f"🚨@{username} ({user_id}) è stato approvato.")
-            del PENDING_REQUESTS[user_id]
-
-        notify_admins("⚡️ Tutte le richieste sono state approvate.")
-    except Exception as e:
-        bot.reply_to(message, "Errore durante l'approvazione di massa.")
+PENDING_REQUESTS = {}
 
 def setup_database():
-    conn = get_db_connection()
+    conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS admins (
-        user_id BIGINT PRIMARY KEY
+        user_id INTEGER PRIMARY KEY
     )
     """)
     conn.commit()
     conn.close()
 
+def add_admin(user_id):
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+def is_admin(user_id):
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+def notify_admins(context, message):
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM admins")
+    admins = cursor.fetchall()
+    conn.close()
+    for admin in admins:
+        context.bot.send_message(chat_id=admin[0], text=message)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "[N/A]"
+
+    if user_id in PENDING_REQUESTS:
+        await update.message.reply_text("Hai già richiesto l'accesso. Attendi una risposta.")
+        return
+
+    PENDING_REQUESTS[user_id] = username
+    await update.message.reply_text(
+        "⏰ La tua richiesta per unirti al canale è stata mandata. "
+        "Un amministratore ti approverà/rifiuterà il prima possibile."
+    )
+    notify_admins(
+        context,
+        f"❗️@{username} ({user_id}) ha richiesto di unirsi al canale."
+    )
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != SUPER_ADMIN:
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usa il comando con: /admin {UserID}")
+        return
+
+    user_id = context.args[0]
+    if user_id.isdigit():
+        add_admin(int(user_id))
+        await update.message.reply_text(f"L'utente {user_id} è stato aggiunto come amministratore.")
+    else:
+        await update.message.reply_text("ID utente non valido.")
+
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        await update.message.reply_text("Usa il comando con: /approve {UserID}")
+        return
+
+    user_id = int(context.args[0]) if context.args[0].isdigit() else None
+    if user_id not in PENDING_REQUESTS:
+        await update.message.reply_text("Richiesta non trovata.")
+        return
+
+    username = PENDING_REQUESTS.pop(user_id)
+    invite_link = f"https://t.me/joinchat/{datetime.now().timestamp()}"  # Simulazione
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"✅ La tua richiesta è stata approvata.\n\n📎 > {invite_link}"
+    )
+    notify_admins(context, f"🚨@{username} ({user_id}) è stato approvato.")
+
+async def deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Usa il comando con: /deny {UserID} {motivo opzionale}")
+        return
+
+    user_id = int(context.args[0]) if context.args[0].isdigit() else None
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Nessun motivo specificato."
+
+    if user_id not in PENDING_REQUESTS:
+        await update.message.reply_text("Richiesta non trovata.")
+        return
+
+    username = PENDING_REQUESTS.pop(user_id)
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"❌ La tua richiesta è stata rifiutata.\n\n❓ Motivo: {reason}"
+    )
+    notify_admins(context, f"🚨 La richiesta di @{username} ({user_id}) è stata rifiutata.")
+
+async def approve_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    for user_id, username in list(PENDING_REQUESTS.items()):
+        invite_link = f"https://t.me/joinchat/{datetime.now().timestamp()}"  # Simulazione
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ La tua richiesta è stata approvata.\n\n📎 > {invite_link}"
+        )
+        notify_admins(context, f"🚨@{username} ({user_id}) è stato approvato.")
+        del PENDING_REQUESTS[user_id]
+
+    notify_admins(context, "⚡️ Tutte le richieste sono state approvate.")
+
 if __name__ == "__main__":
     setup_database()
-    bot.infinity_polling()
+    app = ApplicationBuilder().token("YOUR_BOT_TOKEN").build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CommandHandler("approve", approve))
+    app.add_handler(CommandHandler("deny", deny))
+    app.add_handler(CommandHandler("approveall", approve_all))
+
+    app.run_polling()
