@@ -1,222 +1,130 @@
 import telebot
-import mysql.connector
-from datetime import datetime, timedelta
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import requests
 import time
+import threading
 
-# Dati di connessione al bot
-API_TOKEN = '7203175973:AAGGPJnAezqG6iaXYrX_chmreYwBxUYwbwI'
-bot = telebot.TeleBot(API_TOKEN)
+TOKEN = "7394722114:AAEcxc3HKVxAtUoYFEMzm_K1kKvTuTQ7MLM"
+NOWPAYMENTS_API_KEY = "319RDCY-V5AMDRP-ND9TYR8-X3YNWWT"
+bot = telebot.TeleBot(TOKEN)
 
-# Dati di connessione al database
-db_config = {
-    'user': 'root',
-    'password': 'BpwzWzXkJkSAdmoYdWdSfLRVobOHYQNa',
-    'host': 'mysql.railway.internal',
-    'database': 'railway',
-    'port': 3306
+user_data = {}
+ADMIN_IDS = [7839114402, 7768881599]
+
+prefix_prices = {
+    "+39": 5.0,
+    "+1": 3.0,
+    "+44": 4.0,
+    "+7": 6.0,
+    "+62": 2.5,
+    "+212": 3.5,
+    "+880": 4.0,
 }
 
-# Connessione al database MySQL
-def connect_db():
-    return mysql.connector.connect(**db_config)
+def generate_ltc_address(user_id, amount):
+    url = "https://api.nowpayments.io/v1/payment"
+    headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
+    data = {
+        "price_amount": amount,
+        "price_currency": "eur",
+        "pay_currency": "ltc",
+        "ipn_callback_url": "https://your-callback-url.com",
+        "order_id": f"user_{user_id}_{int(time.time())}",
+        "order_description": f"Ricarica di {amount}€"
+    }
+    response = requests.post(url, json=data, headers=headers)
+    if response.status_code == 201:
+        result = response.json()
+        return result.get("pay_address"), result.get("payment_id")
+    return None, None
 
-# Funzione per inviare un messaggio agli amministratori
-def notify_admins(message):
-    connection = connect_db()
-    cursor = connection.cursor()
-    cursor.execute("SELECT user_id FROM admins")
-    admins = cursor.fetchall()
-    connection.close()
-
-    for admin in admins:
-        bot.send_message(admin[0], message)
-
-# Aggiungi un amministratore (solo per il capo supremo)
-@bot.message_handler(commands=['admin'])
-def add_admin(message):
-    if message.from_user.id == 7839114402:  # Solo il capo supremo può aggiungere amministratori
-        username_or_id = message.text.split()[1]
-        connection = connect_db()
-        cursor = connection.cursor()
-        
-        if username_or_id.isdigit():
-            user_id = int(username_or_id)
-            cursor.execute("INSERT INTO admins (user_id) VALUES (%s)", (user_id,))
-        else:
-            cursor.execute("SELECT user_id FROM users WHERE username = %s", (username_or_id,))
-            user = cursor.fetchone()
-            if user:
-                cursor.execute("INSERT INTO admins (user_id) VALUES (%s)", (user[0],))
+def check_payment(user_id, payment_id, amount):
+    url = f"https://api.nowpayments.io/v1/payment/{payment_id}"
+    headers = {"x-api-key": NOWPAYMENTS_API_KEY}
+    
+    for _ in range(288):  # 288 iterazioni da 5 minuti (totale: 24 ore)
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            payment_data = response.json()
+            print(payment_data)  # Debug: stampa la risposta API
+            
+            payment_status = payment_data.get("payment_status")
+            price_currency = payment_data.get("price_currency", "EUR")
+            
+            if price_currency != "EUR":
+                paid_amount = payment_data.get("price_amount", 0)  # Usa l'importo in EUR
             else:
-                bot.reply_to(message, "Utente non trovato.")
-                return
-        
-        connection.commit()
-        connection.close()
-        bot.reply_to(message, "Amministratore aggiunto con successo.")
+                paid_amount = payment_data.get("paid_amount", 0)
 
-# Gestione della richiesta di unione al canale
+            if payment_status == "finished":
+                user_data[user_id]["balance"] += paid_amount
+                bot.send_message(user_id, f"✅ Il tuo pagamento di {paid_amount}€ è stato ricevuto con successo!\n💰 Il tuo saldo attuale è: {user_data[user_id]['balance']}€.")
+                return
+            elif payment_status == "partial_payment":
+                bot.send_message(user_id, f"⚠️ Pagamento parziale. Hai inviato {paid_amount}€, ne mancano {amount - paid_amount}€.")
+        
+        time.sleep(300)  # Aspetta 5 minuti prima del prossimo controllo
+    
+    bot.send_message(user_id, "⏳ Non è stato ricevuto un pagamento entro 24 ore. Contatta il supporto se hai pagato.")
+
 @bot.message_handler(commands=['start'])
 def start(message):
-    user_id = message.from_user.id
-    username = message.from_user.username
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🛍 Compra", callback_data="compra"))
+    markup.add(InlineKeyboardButton("💳 Ricarica saldo", callback_data="ricarica"))
+    bot.send_message(message.chat.id, "✨ Benvenuto! Usa i pulsanti per gestire gli acquisti.", reply_markup=markup)
     
-    # Controlla se l'utente ha già richiesto l'accesso
-    connection = connect_db()
-    cursor = connection.cursor()
-    cursor.execute("SELECT * FROM requests WHERE user_id = %s", (user_id,))
-    existing_request = cursor.fetchone()
-    
-    if existing_request:
-        bot.reply_to(message, "Hai già inviato una richiesta di adesione e sei in attesa di approvazione.")
-        connection.close()
-        return
-    
-    # Invia la richiesta di unione
-    cursor.execute("INSERT INTO requests (user_id, username, timestamp) VALUES (%s, %s, %s)", 
-                   (user_id, username, datetime.now()))
-    connection.commit()
-    connection.close()
-    
-    bot.reply_to(message, " ⏰ La tua richiesta per unirti al canale è stata mandata. Un amministratore ti approverà/rifiuterà il prima possibile.")
-    
-    # Notifica agli amministratori
-    notify_admins(f"❗️{username} ({user_id}) ha richiesto di unirsi al canale.")
+    if message.chat.id not in user_data:
+        user_data[message.chat.id] = {"balance": 0, "waiting_for_amount": False}
 
-# Gestione dell'approvazione
-@bot.message_handler(commands=['approve'])
-def approve(message):
-    if message.from_user.id != 7839114402:  # Solo il capo supremo può approvare
-        bot.reply_to(message, "Non hai i permessi per eseguire questa azione.")
-        return
+@bot.callback_query_handler(func=lambda call: True)
+def handle_query(call):
+    chat_id = call.message.chat.id
+    if call.data == "compra":
+        markup = InlineKeyboardMarkup()
+        for prefix in prefix_prices:
+            markup.add(InlineKeyboardButton(prefix, callback_data=f"prefix_{prefix}"))
+        bot.send_message(chat_id, "📞 Scegli il prefisso VoIP:", reply_markup=markup)
     
-    # Estrai l'ID o username dell'utente
-    parts = message.text.split()
-    username_or_id = parts[1]
-    user_id = None
-    
-    # Trova l'ID dell'utente
-    connection = connect_db()
-    cursor = connection.cursor()
-    
-    if username_or_id.isdigit():
-        user_id = int(username_or_id)
-    else:
-        cursor.execute("SELECT user_id FROM users WHERE username = %s", (username_or_id,))
-        user = cursor.fetchone()
-        if user:
-            user_id = user[0]
-    
-    if not user_id:
-        bot.reply_to(message, "Utente non trovato.")
-        connection.close()
-        return
-    
-    # Verifica che l'utente abbia richiesto l'accesso
-    cursor.execute("SELECT * FROM requests WHERE user_id = %s", (user_id,))
-    request = cursor.fetchone()
-    
-    if not request:
-        bot.reply_to(message, "Nessuna richiesta trovata per questo utente.")
-        connection.close()
-        return
-    
-    # Crea il link temporaneo
-    link = f"https://t.me/joinchat/{-1002297768070}?invite_code={user_id}"
-    
-    # Invia il link all'utente
-    bot.send_message(user_id, f"✅ La tua richiesta è stata approvata.\n\n📎 > {link}")
-    
-    # Notifica gli amministratori
-    notify_admins(f"🚨 {username_or_id} è stato approvato.")
-    
-    # Elimina la richiesta
-    cursor.execute("DELETE FROM requests WHERE user_id = %s", (user_id,))
-    connection.commit()
-    connection.close()
-
-# Gestione del rifiuto
-@bot.message_handler(commands=['deny'])
-def deny(message):
-    if message.from_user.id != 7839114402:  # Solo il capo supremo può rifiutare
-        bot.reply_to(message, "Non hai i permessi per eseguire questa azione.")
-        return
-    
-    # Estrai l'ID o username dell'utente
-    parts = message.text.split()
-    username_or_id = parts[1]
-    user_id = None
-    reason = 'Nessun motivo fornito.'
-    
-    if len(parts) > 2:
-        reason = ' '.join(parts[2:])
-    
-    # Trova l'ID dell'utente
-    connection = connect_db()
-    cursor = connection.cursor()
-    
-    if username_or_id.isdigit():
-        user_id = int(username_or_id)
-    else:
-        cursor.execute("SELECT user_id FROM users WHERE username = %s", (username_or_id,))
-        user = cursor.fetchone()
-        if user:
-            user_id = user[0]
-    
-    if not user_id:
-        bot.reply_to(message, "Utente non trovato.")
-        connection.close()
-        return
-    
-    # Verifica che l'utente abbia richiesto l'accesso
-    cursor.execute("SELECT * FROM requests WHERE user_id = %s", (user_id,))
-    request = cursor.fetchone()
-    
-    if not request:
-        bot.reply_to(message, "Nessuna richiesta trovata per questo utente.")
-        connection.close()
-        return
-    
-    # Invia la notifica di rifiuto
-    bot.send_message(user_id, f"❌ La tua richiesta è stata rifiutata.\n\n❓ motivo: {reason}")
-    
-    # Notifica gli amministratori
-    notify_admins(f"🚨 La richiesta di {username_or_id} è stata rifiutata.\nMotivo: {reason}")
-    
-    # Elimina la richiesta
-    cursor.execute("DELETE FROM requests WHERE user_id = %s", (user_id,))
-    connection.commit()
-    connection.close()
-
-# Comando /approveall per approvare tutte le richieste
-@bot.message_handler(commands=['approveall'])
-def approve_all(message):
-    if message.from_user.id != 7839114402:  # Solo il capo supremo può approvare tutte le richieste
-        bot.reply_to(message, "Non hai i permessi per eseguire questa azione.")
-        return
-    
-    connection = connect_db()
-    cursor = connection.cursor()
-    
-    cursor.execute("SELECT user_id, username FROM requests")
-    requests = cursor.fetchall()
-    
-    for request in requests:
-        user_id, username = request
-        # Crea il link temporaneo
-        link = f"https://t.me/joinchat/{-1002297768070}?invite_code={user_id}"
-        bot.send_message(user_id, f"✅ La tua richiesta è stata approvata.\n\n📎 > {link}")
+    elif call.data.startswith("prefix_"):
+        prefix = call.data.split("_")[1]
+        price = prefix_prices.get(prefix, 0)
         
-        # Notifica gli amministratori
-        notify_admins(f"🚨 {username} è stato approvato.")
-        
-        # Elimina la richiesta
-        cursor.execute("DELETE FROM requests WHERE user_id = %s", (user_id,))
+        if user_data[chat_id]["balance"] >= price:
+            user_data[chat_id]["balance"] -= price
+            bot.delete_message(chat_id, call.message.message_id)
+            bot.send_message(chat_id, f"✅ VoIP {prefix} acquistato con successo!\n💰 Saldo rimanente: {user_data[chat_id]['balance']}€")
+        else:
+            bot.send_message(chat_id, "❌ Saldo insufficiente. Ricarica con /ricarica.")
     
-    connection.commit()
-    connection.close()
-    
-    bot.reply_to(message, "⚡️ Tutte le richieste sono state approvate.")
+    elif call.data == "ricarica":
+        user_data[chat_id]["waiting_for_amount"] = True
+        bot.send_message(chat_id, "💵 Inserisci l'importo da ricaricare (minimo 3€):")
 
-# Avvio del bot
+@bot.message_handler(func=lambda message: user_data.get(message.chat.id, {}).get("waiting_for_amount", False))
+def handle_amount(message):
+    chat_id = message.chat.id
+    try:
+        amount = float(message.text)
+        if amount < 1:
+            bot.send_message(chat_id, "⚠️ L'importo deve essere almeno 3€.")
+            return
+        
+        ltc_address, payment_id = generate_ltc_address(chat_id, amount)
+        if ltc_address:
+            bot.send_message(chat_id, f"💰 Invia {amount}€ in LTC a questo indirizzo:\n{ltc_address}", parse_mode="Markdown")
+            threading.Thread(target=check_payment, args=(chat_id, payment_id, amount)).start()
+        else:
+            bot.send_message(chat_id, "❌ Errore nella generazione dell'indirizzo di pagamento.")
+    
+    except ValueError:
+        bot.send_message(chat_id, "❌ Inserisci un numero valido.")
+    
+    user_data[chat_id]["waiting_for_amount"] = False
+
+@bot.message_handler(commands=['balance'])
+def balance(message):
+    saldo = user_data.get(message.chat.id, {}).get("balance", 0)
+    bot.send_message(message.chat.id, f"💰 Saldo attuale: {saldo}€")
+
 bot.polling(none_stop=True)
